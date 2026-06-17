@@ -156,6 +156,26 @@ class AbuseIPChecker:
         with self._lock:
             return dict(self._cache)
 
+    def fetch_details(self, ip: str) -> Optional[dict]:
+        """Fetch the full AbuseIPDB report for a single IP (verbose, with reports).
+
+        Returns the API 'data' object, or None on failure.
+        """
+        try:
+            params = urllib.parse.urlencode({
+                "ipAddress": ip,
+                "maxAgeInDays": str(self.max_age_days),
+                "verbose": "",
+            })
+            req = urllib.request.Request(f"{self.API_URL}?{params}")
+            req.add_header("Key", self.api_key)
+            req.add_header("Accept", "application/json")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("data")
+        except Exception:
+            return None
+
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False)
 
@@ -181,6 +201,37 @@ def _format_abuse_score(score: Optional[int], pending: bool) -> Text:
     if score < 75:
         return Text(str(score), style="bold yellow")
     return Text(str(score), style="bold red")
+
+
+# AbuseIPDB report category IDs -> human-readable names
+ABUSE_CATEGORIES: Dict[int, str] = {
+    1: "DNS Compromise", 2: "DNS Poisoning", 3: "Fraud Orders",
+    4: "DDoS Attack", 5: "FTP Brute-Force", 6: "Ping of Death",
+    7: "Phishing", 8: "Fraud VoIP", 9: "Open Proxy", 10: "Web Spam",
+    11: "Email Spam", 12: "Blog Spam", 13: "VPN IP", 14: "Port Scan",
+    15: "Hacking", 16: "SQL Injection", 17: "Spoofing", 18: "Brute-Force",
+    19: "Bad Web Bot", 20: "Exploited Host", 21: "Web App Attack",
+    22: "SSH", 23: "IoT Targeted",
+}
+
+
+def _categories_label(ids: list) -> str:
+    names = [ABUSE_CATEGORIES.get(int(c), str(c)) for c in (ids or [])]
+    return ", ".join(names) if names else "-"
+
+
+# Substrings (lowercase) of ISPs/orgs reconhecidamente reputáveis. Um IP cujo
+# ISP bate com algum destes raramente é uma ameaça real — reforça falso positivo.
+_REPUTABLE_ISPS = [
+    "google", "cloudflare", "amazon", "aws", "microsoft", "azure",
+    "akamai", "meta", "facebook", "new relic", "fastly", "apple",
+    "oracle", "digitalocean", "linode", "github", "gitlab",
+]
+
+
+def _is_reputable_isp(isp: str) -> bool:
+    low = (isp or "").lower()
+    return any(name in low for name in _REPUTABLE_ISPS)
 
 
 # ---------------------------------------------------------------------------
@@ -598,9 +649,10 @@ class NetworkMonitor:
             capture_thread.join(timeout=2.0)
             if self.logger is not None:
                 self.logger.close()
+            self._print_final_summary()
+            self._interactive_ip_lookup()
             if self.checker is not None:
                 self.checker.shutdown()
-            self._print_final_summary()
 
     def _print_final_summary(self) -> None:
         self.console.rule("[bold]Final summary[/bold]")
@@ -664,6 +716,167 @@ class NetworkMonitor:
 
         if self.logger is not None:
             self.console.print(f"Log written to: [bold]{self.logger.path}[/bold]")
+
+    # ----- interactive drill-down -----
+    def _interactive_ip_lookup(self) -> None:
+        """After the summary, let the user inspect any IP in detail (AbuseIPDB)."""
+        if self.checker is None:
+            return
+        if not sys.stdin or not sys.stdin.isatty():
+            return  # no interactive terminal (e.g. piped/redirected)
+
+        checked = self.checker.snapshot()
+        self.console.rule("[bold]Verificação detalhada de IP[/bold]")
+        self.console.print(
+            "Digite um IP para ver os detalhes completos no AbuseIPDB "
+            "(ISP, país, denúncias...).\n"
+            "Pressione [bold]Enter[/bold] vazio para sair."
+        )
+        if checked:
+            self.console.print(
+                f"[dim]IPs verificados nesta sessão: "
+                f"{', '.join(sorted(checked.keys()))}[/dim]"
+            )
+
+        while True:
+            try:
+                choice = input("\nIP> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                self.console.print()
+                return
+            if not choice:
+                return
+            try:
+                ipaddress.ip_address(choice)
+            except ValueError:
+                self.console.print(f"[yellow]'{choice}' não é um IP válido.[/yellow]")
+                continue
+
+            self.console.print(f"[dim]Consultando {choice}...[/dim]")
+            data = self.checker.fetch_details(choice)
+            if not data:
+                self.console.print(
+                    "[red]Falha na consulta. Verifique a chave da API e a conexão.[/red]"
+                )
+                continue
+            self._render_ip_details(data)
+
+    def _render_ip_details(self, data: dict) -> None:
+        score = int(data.get("abuseConfidenceScore", 0) or 0)
+        if score == 0:
+            border, verdict = "green", Text("Limpo", style="green")
+        elif score < 25:
+            border, verdict = "yellow", Text("Baixo risco", style="yellow")
+        elif score < 75:
+            border, verdict = "yellow", Text("Risco médio", style="bold yellow")
+        else:
+            border, verdict = "red", Text("MALICIOSO", style="bold red")
+
+        hostnames = data.get("hostnames") or []
+        flags = []
+        if data.get("isTor"):
+            flags.append("Tor")
+        if data.get("isWhitelisted"):
+            flags.append("Whitelisted")
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(style="bold cyan", justify="right")
+        grid.add_column()
+        grid.add_row("IP:", str(data.get("ipAddress", "-")))
+        grid.add_row("Score:", _format_abuse_score(score, False))
+        grid.add_row("Veredito:", verdict)
+        grid.add_row("País:", str(data.get("countryName") or data.get("countryCode") or "-"))
+        grid.add_row("ISP:", str(data.get("isp") or "-"))
+        grid.add_row("Domínio:", str(data.get("domain") or "-"))
+        grid.add_row("Tipo de uso:", str(data.get("usageType") or "-"))
+        grid.add_row("Hostnames:", ", ".join(hostnames) if hostnames else "-")
+        grid.add_row("Total de denúncias:", str(data.get("totalReports", 0)))
+        grid.add_row("Usuários distintos:", str(data.get("numDistinctUsers", 0)))
+        grid.add_row("Última denúncia:", str(data.get("lastReportedAt") or "-"))
+        if flags:
+            grid.add_row("Flags:", Text(", ".join(flags), style="bold magenta"))
+
+        self.console.print(
+            Panel(grid, title=f"Detalhes — {data.get('ipAddress', '')}",
+                  border_style=border)
+        )
+
+        reports = data.get("reports") or []
+        if reports:
+            rtable = Table(
+                title=f"Denúncias recentes (mostrando {min(len(reports), 5)} de {len(reports)})",
+                header_style="bold white on dark_blue",
+            )
+            rtable.add_column("Data", width=20, no_wrap=True)
+            rtable.add_column("Categorias")
+            rtable.add_column("Comentário", overflow="fold")
+            for rep in reports[:5]:
+                comment = (rep.get("comment") or "").strip().replace("\n", " ")
+                if len(comment) > 120:
+                    comment = comment[:117] + "..."
+                rtable.add_row(
+                    str(rep.get("reportedAt", "-")),
+                    _categories_label(rep.get("categories")),
+                    comment or "-",
+                )
+            self.console.print(rtable)
+
+        self.console.print(self._interpretation_panel(score, data))
+
+    def _interpretation_panel(self, score: int, data: dict) -> Panel:
+        """Plain-language guidance on how to read the score for this IP."""
+        isp = str(data.get("isp") or "")
+        note = Text()
+        if score == 0:
+            note.append("Sem denúncias relevantes. ", style="bold green")
+            note.append("IP considerado limpo pelo AbuseIPDB.")
+        elif score < 25:
+            note.append("Score baixo — frequentemente é FALSO POSITIVO.\n", style="bold yellow")
+            note.append(
+                "Honeypots e firewalls domésticos (MikroTik, UFW...) denunciam "
+                "automaticamente qualquer conexão inesperada, inclusive tráfego de "
+                "resposta legítimo. Se o ISP é uma empresa conhecida (Google, "
+                "Cloudflare, AWS, New Relic...), quase sempre é benigno."
+            )
+        elif score < 75:
+            note.append("Risco moderado — vale investigar.\n", style="bold yellow")
+            note.append(
+                "Olhe as categorias e os comentários das denúncias acima e confira "
+                "o ISP. Padrão repetido de Hacking/Brute-Force/Port Scan vindo de um "
+                "ISP obscuro merece atenção; ISP conhecido tende a ser ruído."
+            )
+        else:
+            note.append("Score alto — trate como potencialmente malicioso.\n", style="bold red")
+            note.append(
+                "Se as categorias mostram Hacking, SSH, Brute-Force ou Web App Attack "
+                "de forma repetida e o ISP é desconhecido, considere bloquear esse IP "
+                "no firewall."
+            )
+        # --- Sinais automáticos ---
+        total = int(data.get("totalReports", 0) or 0)
+        users = int(data.get("numDistinctUsers", 0) or 0)
+
+        if _is_reputable_isp(isp):
+            note.append("\n\n• ISP reconhecido como provedor reputável", style="bold green")
+            note.append(
+                " — reforça que provavelmente é tráfego legítimo / falso positivo.",
+                style="green",
+            )
+
+        # Denúncias concentradas: muitas denúncias vindas de pouquíssimos denunciantes.
+        if total >= 5 and users > 0 and total / users >= 4:
+            note.append("\n\n• Denúncias concentradas", style="bold cyan")
+            note.append(
+                f" — {total} denúncias de apenas {users} denunciante(s) "
+                f"(~{total / users:.0f} por pessoa). Poucos denunciantes "
+                "repetindo costuma indicar ruído de honeypot, não ameaça ampla.",
+                style="cyan",
+            )
+
+        if isp:
+            note.append(f"\n\nISP deste IP: ", style="dim")
+            note.append(isp, style="bold")
+        return Panel(note, title="Como interpretar", border_style="cyan")
 
 
 # ---------------------------------------------------------------------------
