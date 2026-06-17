@@ -128,3 +128,22 @@ Pressione **Ctrl+C** para parar. Um resumo final será exibido no terminal.
 - `1–24` — baixo risco
 - `25–74` — risco médio
 - `75–100` — IP malicioso (vermelho)
+
+---
+
+## Inspeção detalhada de um IP
+
+Ao parar o monitor com **Ctrl+C**, depois do resumo final o programa pergunta se você quer investigar algum IP que trafegou na rede:
+
+```
+── Verificação detalhada de IP ──
+Digite um IP para ver os detalhes completos no AbuseIPDB (ISP, país, denúncias...).
+Pressione Enter vazio para sair.
+IPs verificados nesta sessão: 118.25.6.39, ...
+
+IP> 118.25.6.39
+```
+
+Digite o IP desejado e ele mostra um painel com **ISP, país, domínio, tipo de uso, total de denúncias** e a lista das **denúncias recentes** (com data, categorias e comentário). Repita quantas vezes quiser; pressione **Enter** vazio para encerrar.
+
+> Requer a chave do AbuseIPDB configurada (veja a seção de configuração acima). O recurso é ignorado se a saída não for um terminal interativo.
